@@ -69,42 +69,42 @@ H1 (Mental Health): Composite HRV+sleep readiness → predicts/detects depressio
 H2 (Cognition/Marks): Composite HRV+sleep readiness → predicts/improves GPA, test scores, retention, recall
 
 ## Extract and return ONLY valid JSON:
-{
+{{
   "supports_h1": true/false/null,
   "supports_h2": true/false/null,
   "focus_score_relevant": true/false,
   "composite_metric_used": true/false,
   "markers": [
-    {
+    {{
       "type": "HRV" | "sleep" | "composite" | "cortisol" | "other",
       "measure": "e.g. RMSSD, SDNN, PSQI, Focus Score, recovery score, etc.",
       "threshold": "e.g. RMSSD > 50ms, PSQI < 5, sleep > 7h",
       "direction": "higher better" | "lower better" | null
-    }
+    }}
   ],
   "outcomes": [
-    {
+    {{
       "type": "depression" | "anxiety" | "insomnia" | "stress" | "cognition" | "academic" | "retention" | "recall" | "other",
       "measure": "e.g. PHQ-9, GAD-7, ISI, GPA, exam score, attention, working memory",
       "direction": "improved" | "worsened" | "no effect" | null
-    }
+    }}
   ],
-  "effect_size": {
+  "effect_size": {{
     "cohens_d": null or number,
     "r": null or number,
     "p_value": null or number
-  },
-  "sample": {
+  }},
+  "sample": {{
     "n": null or integer,
     "population": "students" | "university" | "medical_students" | "general" | "clinical" | "mixed",
     "age_range": "e.g. 18-25" or null
-  },
+  }},
   "study_type": "rct" | "cohort" | "cross_sectional" | "meta_analysis" | "review" | "case_study" | "other",
   "has_numerical_threshold": true/false,
   "replicates_pilot": true/false,
   "pilot_finding_replicated": "e.g. HRV-depression correlation, sleep-insomnia correlation, composite better than individual" or null,
   "key_finding": "1-2 sentence summary most relevant to Focus Score hypothesis"
-}
+}}
 
 Return ONLY the JSON object, no other text.
 

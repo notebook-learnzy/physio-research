@@ -173,67 +173,82 @@ class PubMedCrawler:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SOURCE 2: Semantic Scholar (public API — 100 req/5min without key)
+# SOURCE 2: OpenAlex (public API — fully open, no keys, huge dataset)
 # ═══════════════════════════════════════════════════════════════════════════════
-class SemanticScholarCrawler:
-    BASE = "https://api.semanticscholar.org/graph/v1"
-    FIELDS = "title,abstract,year,authors,externalIds,url"
+class OpenAlexCrawler:
+    BASE = "https://api.openalex.org/works"
 
     def search(self, query: str, max_results: int = 60) -> list[Paper]:
-        log.info(f"[SemanticScholar] Searching: {query!r}")
+        log.info(f"[OpenAlex] Searching: {query!r}")
         papers = []
-        offset = 0
-        limit = min(100, max_results)
+        page = 1
+        per_page = min(100, max_results)
         while len(papers) < max_results:
-            batch = self._search_batch(query, offset, limit)
+            batch = self._search_page(query, page, per_page)
             if not batch:
                 break
             papers.extend(batch)
-            offset += limit
-            if offset >= max_results:
+            page += 1
+            if len(batch) < per_page:
                 break
             safe_sleep(0.5)
-        log.info(f"[SemanticScholar] Found {len(papers)} papers")
+        log.info(f"[OpenAlex] Found {len(papers)} papers")
         return papers[:max_results]
 
     @make_retry()
-    def _search_batch(self, query: str, offset: int, limit: int) -> list[Paper]:
+    def _search_page(self, query: str, page: int, per_page: int) -> list[Paper]:
         params = {
-            "query": query,
-            "offset": offset,
-            "limit": limit,
-            "fields": self.FIELDS,
+            "search": query,
+            "filter": "has_abstract:true",
+            "page": page,
+            "per_page": per_page,
+            "mailto": "research@physio-research.ai",
         }
         with httpx.Client(timeout=20) as client:
-            resp = client.get(f"{self.BASE}/paper/search", params=params, headers=get_headers())
-            if resp.status_code == 429:
-                log.warning("[SemanticScholar] Rate limited, backing off 60s")
-                time.sleep(60)
-                return []
+            resp = client.get(self.BASE, params=params, headers=get_headers())
             resp.raise_for_status()
             safe_sleep()
             data = resp.json()
             papers = []
-            for item in data.get("data", []):
+            for item in data.get("results", []):
                 title = (item.get("title") or "").strip()
-                abstract = (item.get("abstract") or "").strip()
+                abstract = self._reconstruct_abstract(item.get("abstract_inverted_index", {}))
                 if not title or not abstract:
                     continue
-                ext_ids = item.get("externalIds") or {}
-                doi = ext_ids.get("DOI", "")
-                year = item.get("year") or 2000
-                authors = [a.get("name", "") for a in (item.get("authors") or [])]
-                url = item.get("url") or f"https://www.semanticscholar.org/paper/{item.get('paperId','')}"
+                doi = (item.get("doi") or "").replace("https://doi.org/", "")
+                year = item.get("publication_year") or 2000
+                
+                authors = []
+                for a in item.get("authorships", []):
+                    author_name = a.get("author", {}).get("display_name", "")
+                    if author_name:
+                        authors.append(author_name)
+                
+                url = item.get("primary_location", {}).get("landing_page_url") or item.get("doi") or ""
+                
                 papers.append(Paper(
                     title=title,
                     abstract=abstract,
                     doi=doi,
                     year=year,
                     authors=authors,
-                    source="semantic_scholar",
+                    source="openalex",
                     url=url,
                 ))
             return papers
+
+    def _reconstruct_abstract(self, inverted_index: dict) -> str:
+        if not inverted_index:
+            return ""
+        try:
+            max_idx = max(idx for indices in inverted_index.values() for idx in indices)
+            words = [""] * (max_idx + 1)
+            for word, indices in inverted_index.items():
+                for idx in indices:
+                    words[idx] = word
+            return " ".join(words).strip()
+        except:
+            return ""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -539,13 +554,13 @@ def search_all(
     Returns deduplicated list of new papers only.
     """
     if sources is None:
-        sources = ["pubmed", "semantic_scholar", "crossref", "europepmc", "biorxiv", "google_scholar"]
+        sources = ["pubmed", "openalex", "crossref", "europepmc", "biorxiv", "google_scholar"]
     if existing_ids is None:
         existing_ids = set()
 
     crawlers = {
         "pubmed": PubMedCrawler(),
-        "semantic_scholar": SemanticScholarCrawler(),
+        "openalex": OpenAlexCrawler(),
         "crossref": CrossRefCrawler(),
         "europepmc": EuropePMCCrawler(),
         "biorxiv": BioRxivCrawler(),
