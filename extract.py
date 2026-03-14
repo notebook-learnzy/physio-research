@@ -21,7 +21,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 log = logging.getLogger("extract")
 
-CLAUDE_MODEL = "claude-haiku-4-5"  # Claude Haiku — fast + cheap
+CLAUDE_MODEL = "claude-3-5-haiku-20241022"  # Claude 3.5 Haiku — fast + cheap
 MAX_TOKENS_PER_CALL = 1024
 TARGET_TOKENS_PER_MIN = 2000  # rate limit to stay within budget
 
