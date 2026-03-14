@@ -1,0 +1,114 @@
+name: Physio-Research Autonomous Loop
+
+on:
+  # Run every 5 minutes (matches autoresearch's 5-min budget per experiment)
+  schedule:
+    - cron: '*/5 * * * *'
+  # Allow manual trigger from GitHub Actions UI
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (skip LLM extraction)?'
+        required: false
+        default: 'false'
+      iterations:
+        description: 'Max iterations (blank = run until time budget)'
+        required: false
+        default: ''
+
+# Prevent overlapping runs — if a run is already in progress, skip
+concurrency:
+  group: physio-research-loop
+  cancel-in-progress: false  # let running experiment finish
+
+permissions:
+  contents: write  # needed to commit findings.jsonl and results.tsv
+
+jobs:
+  research:
+    name: Research Experiment
+    runs-on: ubuntu-latest
+    timeout-minutes: 8  # kill if something hangs past 8 min (5-min budget + 3-min overhead)
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Configure git identity
+        run: |
+          git config user.name "physio-research-bot"
+          git config user.email "research-bot@physio-research.ai"
+
+      - name: Run research experiment
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
+          ITERS="${{ github.event.inputs.iterations || '' }}"
+
+          CMD="python research.py --time-budget 270"
+
+          if [ "$DRY_RUN" = "true" ]; then
+            CMD="$CMD --dry-run"
+          fi
+
+          if [ -n "$ITERS" ]; then
+            CMD="$CMD --iterations $ITERS"
+          fi
+
+          echo "Running: $CMD"
+          $CMD 2>&1 | tee run.log
+
+      - name: Extract key metric
+        if: always()
+        run: |
+          echo "=== Evidence Score ==="
+          grep "^evidence_score:" run.log | tail -1 || echo "No evidence_score found"
+          echo "=== H1 Score ==="
+          grep "^h1_score:" run.log | tail -1 || echo "No h1_score found"
+          echo "=== H2 Score ==="
+          grep "^h2_score:" run.log | tail -1 || echo "No h2_score found"
+          echo "=== Papers Total ==="
+          grep "^total_papers:" run.log | tail -1 || echo "No total_papers found"
+
+      - name: Commit and push results
+        if: success()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Check if there are changes to commit
+          if git diff --quiet HEAD -- findings.jsonl results.tsv 2>/dev/null; then
+            echo "No new findings to commit"
+          else
+            git add findings.jsonl results.tsv || true
+            SCORE=$(grep "^evidence_score:" run.log | tail -1 | awk '{print $2}' || echo "?")
+            PAPERS=$(grep "^total_papers:" run.log | tail -1 | awk '{print $2}' || echo "?")
+            git commit -m "research: score=${SCORE} papers=${PAPERS} [$(date -u +'%Y-%m-%dT%H:%M:%SZ')]" || true
+            git push origin HEAD || true
+          fi
+
+      - name: Upload run log as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-log-${{ github.run_number }}
+          path: run.log
+          retention-days: 7  # keep last 7 days of logs
+
+      - name: Show results.tsv summary
+        if: always()
+        run: |
+          echo "=== results.tsv (last 10 rows) ==="
+          tail -10 results.tsv 2>/dev/null || echo "No results.tsv yet"
