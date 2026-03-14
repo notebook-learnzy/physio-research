@@ -1,9 +1,9 @@
 name: Physio-Research Autonomous Loop
 
 on:
-  # Run every 5 minutes (matches autoresearch's 5-min budget per experiment)
+  # Run every 30 minutes — 5-min budget per run, ~48 runs/day, 2000 min total over ~3 days
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '*/30 * * * *'
   # Allow manual trigger from GitHub Actions UI
   workflow_dispatch:
     inputs:
@@ -89,10 +89,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Check if there are changes to commit
-          if git diff --quiet HEAD -- findings.jsonl results.tsv 2>/dev/null; then
+          if git diff --quiet HEAD -- findings.jsonl results.tsv citations.md 2>/dev/null; then
             echo "No new findings to commit"
           else
-            git add findings.jsonl results.tsv || true
+            git add findings.jsonl results.tsv citations.md || true
             SCORE=$(grep "^evidence_score:" run.log | tail -1 | awk '{print $2}' || echo "?")
             PAPERS=$(grep "^total_papers:" run.log | tail -1 | awk '{print $2}' || echo "?")
             git commit -m "research: score=${SCORE} papers=${PAPERS} [$(date -u +'%Y-%m-%dT%H:%M:%SZ')]" || true

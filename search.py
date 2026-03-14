@@ -572,6 +572,97 @@ def search_all(
     return new_papers
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# RELEVANCE PRE-SCORING — rank papers before LLM extraction
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Keyword tiers for Focus Score relevance scoring
+# Tier 1 (weight=3): exact Focus Score concepts
+TIER1_KEYWORDS = [
+    "hrv", "heart rate variability", "rmssd", "sdnn",
+    "sleep quality", "sleep duration", "psqi", "insomnia",
+    "focus score", "readiness score", "composite score", "composite metric",
+    "physiological readiness", "recovery score",
+]
+# Tier 2 (weight=2): outcome measures from hypothesis
+TIER2_KEYWORDS = [
+    "phq-9", "phq9", "gad-7", "gad7", "isi", "insomnia severity",
+    "depression", "anxiety", "mental health", "stress",
+    "academic performance", "gpa", "exam", "test score", "marks",
+    "cognition", "cognitive", "retention", "recall", "memory",
+    "learning", "attention", "working memory",
+]
+# Tier 3 (weight=1): population and method
+TIER3_KEYWORDS = [
+    "student", "university", "college", "undergraduate",
+    "wearable", "smartwatch", "oura", "whoop", "garmin",
+    "biofeedback", "intervention", "rct", "randomized",
+    "cortisol", "autonomic", "parasympathetic", "vagal",
+    "circadian", "bedtime", "sleep efficiency", "aasm",
+    "glucocorticoid", "prefrontal", "cohen",
+    "effect size", "threshold", "biomarker",
+]
+
+
+def relevance_score(paper: 'Paper') -> float:
+    """
+    Compute a keyword-based relevance score for a paper (0.0 to 1.0).
+    Looks at title + abstract text against Focus Score relevant keywords.
+    """
+    text = (paper.title + " " + paper.abstract).lower()
+    score = 0.0
+    max_possible = 0.0
+
+    for kw in TIER1_KEYWORDS:
+        max_possible += 3
+        if kw in text:
+            score += 3
+    for kw in TIER2_KEYWORDS:
+        max_possible += 2
+        if kw in text:
+            score += 2
+    for kw in TIER3_KEYWORDS:
+        max_possible += 1
+        if kw in text:
+            score += 1
+
+    # Bonus: recency (post-2018 papers are more relevant)
+    if paper.year >= 2020:
+        score += 3
+    elif paper.year >= 2015:
+        score += 1
+
+    # Bonus: has abstract (essential for extraction)
+    if len(paper.abstract) > 200:
+        score += 2
+
+    max_possible += 5  # recency + abstract bonus ceiling
+    return min(score / max_possible, 1.0) if max_possible > 0 else 0.0
+
+
+def rank_papers(papers: list['Paper'], top_n: int = 10) -> list['Paper']:
+    """
+    Rank papers by relevance score and return the top N.
+    Logs the scoring for visibility.
+    """
+    if not papers:
+        return []
+
+    scored = [(relevance_score(p), p) for p in papers]
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    log.info(f"[Ranking] Top {top_n} of {len(scored)} papers by relevance:")
+    for i, (score, p) in enumerate(scored[:top_n]):
+        log.info(f"  #{i+1} [{score:.2f}] {p.title[:80]}")
+
+    if len(scored) > top_n:
+        cutoff_score = scored[top_n - 1][0]
+        dropped_score = scored[top_n][0] if len(scored) > top_n else 0
+        log.info(f"  --- cutoff: {cutoff_score:.2f} | next dropped: {dropped_score:.2f} ---")
+
+    return [p for _, p in scored[:top_n]]
+
+
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
