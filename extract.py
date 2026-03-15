@@ -17,7 +17,8 @@ from dataclasses import dataclass, asdict
 from typing import Optional
 
 import anthropic
-from tenacity import retry, stop_after_attempt, wait_exponential
+from anthropic import BadRequestError, NotFoundError, AuthenticationError
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_not_exception_type
 
 log = logging.getLogger("extract")
 
@@ -141,10 +142,16 @@ def make_client() -> anthropic.Anthropic:
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
         raise EnvironmentError("ANTHROPIC_API_KEY not set. Add it to environment or GitHub Secrets.")
+    masked = api_key[:8] + "..." + api_key[-4:] if len(api_key) > 12 else "***"
+    log.info(f"[Extract] Using model={CLAUDE_MODEL}, API key={masked}")
     return anthropic.Anthropic(api_key=api_key)
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=30))
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(min=2, max=30),
+    retry=retry_if_not_exception_type((BadRequestError, NotFoundError, AuthenticationError)),
+)
 def extract_finding(client: anthropic.Anthropic, paper: dict) -> Finding:
     """Extract structured Focus Score evidence from one paper abstract."""
     abstract = paper.get("abstract", "").strip()
@@ -174,11 +181,17 @@ def extract_finding(client: anthropic.Anthropic, paper: dict) -> Finding:
 
     limiter.wait_if_needed(estimated_in + estimated_out)
 
-    response = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=MAX_TOKENS_PER_CALL,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    try:
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=MAX_TOKENS_PER_CALL,
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except (BadRequestError, NotFoundError, AuthenticationError) as e:
+        log.error(f"[Extract] FATAL API error (will NOT retry): {type(e).__name__}")
+        log.error(f"[Extract] Status: {e.status_code}, Body: {e.body}")
+        log.error(f"[Extract] Model used: {CLAUDE_MODEL}")
+        raise
 
     out_tokens = response.usage.output_tokens if response.usage else estimated_out
     in_tokens = response.usage.input_tokens if response.usage else estimated_in
