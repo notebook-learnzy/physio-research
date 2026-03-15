@@ -582,7 +582,15 @@ def search_all(
 
     # Deduplicate and filter out already-seen papers
     deduped = dedup_papers(all_papers)
-    new_papers = [p for p in deduped if p.paper_id not in existing_ids]
+    new_papers = []
+    for p in deduped:
+        if p.paper_id in existing_ids:
+            continue
+        # Filter garbage titles (e.g. "Canada", "Nepal", unusually short titles)
+        if len(p.title) < 10 or len(p.title.split()) <= 2:
+            log.info(f"  Skipping unusually short title: {p.title!r}")
+            continue
+        new_papers.append(p)
     log.info(f"Total: {len(all_papers)} raw → {len(deduped)} deduped → {len(new_papers)} new")
     return new_papers
 

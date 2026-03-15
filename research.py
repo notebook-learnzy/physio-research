@@ -1,13 +1,17 @@
 """
 research.py — Main autonomous research orchestrator for Learnzy Focus Score validation
-Mirrors the karpathy/autoresearch loop but for scientific hypothesis validation.
+Mirrors the karpathy/autoresearch loop for scientific hypothesis validation.
+
+Autoresearch pattern:
+  1. Try an experiment (search query → extract papers)
+  2. If evidence_score IMPROVED → KEEP (merge findings)
+  3. If evidence_score NOT improved → DISCARD (throw away findings)
+  4. Only the best-quality evidence accumulates
 
 Focus Score = 0.4 × HRV_Readiness + 0.6 × Sleep_Recovery (composite, not separate)
 
 Fixed 5-minute budget per run. Crawls papers, extracts findings, scores hypothesis.
-Logs results to results.tsv. Runs indefinitely on GitHub Actions.
-
-Budget: 2000 tokens/minute via Claude Haiku → ~864 runs over 3 days.
+Logs results to results.tsv. Runs on GitHub Actions.
 """
 
 import os
@@ -15,8 +19,10 @@ import sys
 import time
 import json
 import random
+import shutil
 import logging
 import argparse
+import tempfile
 import subprocess
 from dataclasses import asdict
 from pathlib import Path
@@ -140,15 +146,54 @@ def load_existing_paper_ids() -> set:
     return existing
 
 
-def append_findings(findings: list) -> int:
+def write_findings_to_file(findings: list, path: Path) -> int:
+    """Write findings to a JSONL file (append mode)."""
     if not findings:
         return 0
-    with open(FINDINGS_JSONL, "a") as f:
+    with open(path, "a") as f:
         for finding in findings:
             f.write(json.dumps(asdict(finding)) + "\n")
-    # Update citations.md with new papers
-    update_citations(findings)
     return len(findings)
+
+
+def merge_findings(temp_path: Path) -> int:
+    """Merge temp findings into the main findings.jsonl and update citations."""
+    if not temp_path.exists():
+        return 0
+    new_findings = []
+    with open(temp_path) as f:
+        for line in f:
+            if line.strip():
+                new_findings.append(json.loads(line))
+    if not new_findings:
+        return 0
+    # Append to main findings
+    with open(FINDINGS_JSONL, "a") as f:
+        for finding in new_findings:
+            f.write(json.dumps(finding) + "\n")
+    # Update citations
+    update_citations(new_findings)
+    return len(new_findings)
+
+
+def compute_score_with_temp(temp_path: Path) -> float:
+    """Compute evidence_score as if temp findings were merged into main findings."""
+    # Create a combined temp file
+    combined = tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False)
+    try:
+        # Copy existing findings
+        if FINDINGS_JSONL.exists():
+            with open(FINDINGS_JSONL) as f:
+                combined.write(f.read())
+        # Append temp findings
+        if temp_path.exists():
+            with open(temp_path) as f:
+                combined.write(f.read())
+        combined.close()
+        report = compute_evidence_score(Path(combined.name))
+        return report.evidence_score
+    finally:
+        os.unlink(combined.name)
 
 
 def update_citations(findings: list):
@@ -216,6 +261,14 @@ def git_current_commit() -> str:
 
 
 def run_experiment(iteration: int, dry_run: bool = False) -> dict:
+    """Run one experiment following the autoresearch keep/discard pattern.
+
+    1. Search for papers with current query
+    2. Extract findings to a TEMP file (not directly to findings.jsonl)
+    3. Compute score WITH temp findings merged
+    4. If score improved → KEEP (merge temp → findings.jsonl)
+    5. If score not improved → DISCARD (delete temp file)
+    """
     t_start = time.time()
     log.info(f"\n{'='*60}")
     log.info(f"[Research] Iteration {iteration+1} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -224,10 +277,12 @@ def run_experiment(iteration: int, dry_run: bool = False) -> dict:
     existing_ids = load_existing_paper_ids()
     prev_findings = load_findings(FINDINGS_JSONL)
     prev_score = compute_evidence_score(FINDINGS_JSONL).evidence_score if prev_findings else 0.0
+    log.info(f"[Research] Current evidence_score: {prev_score:.6f} (from {len(prev_findings)} papers)")
 
     query = get_next_query(iteration, prev_findings)
     log.info(f"[Query] {query!r}")
 
+    # ── Step 1: Search ──
     log.info("[Search] Crawling papers from all sources...")
     papers = search_all(query=query, max_per_source=MAX_PER_SOURCE, existing_ids=existing_ids)
     papers_found = len(papers)
@@ -240,34 +295,64 @@ def run_experiment(iteration: int, dry_run: bool = False) -> dict:
     else:
         ranked = []
 
+    # ── Step 2: Extract to TEMP file ──
+    temp_path = Path(tempfile.mktemp(suffix=".jsonl", prefix="findings_temp_"))
+    papers_extracted = 0
+    new_findings_count = 0
+    all_failed = False
+
     if dry_run:
         log.info("[DryRun] Skipping LLM extraction")
         log.info(f"[DryRun] Would extract from {len(ranked)} top-ranked papers")
-        papers_extracted = 0
-        new_findings_count = 0
-    else:
-        if ranked:
-            paper_dicts = [asdict(p) if hasattr(p, '__dataclass_fields__') else p for p in ranked]
-            findings = extract_batch(paper_dicts, existing_ids)
-            papers_extracted = len(findings)
-            new_findings_count = append_findings(findings)
+    elif ranked:
+        paper_dicts = [asdict(p) if hasattr(p, '__dataclass_fields__') else p for p in ranked]
+        findings = extract_batch(paper_dicts, existing_ids)
+        papers_extracted = len(findings)
+
+        # Check if ALL extractions failed (API error)
+        ok_findings = [f for f in findings if f.extraction_ok]
+        if papers_extracted > 0 and len(ok_findings) == 0:
+            all_failed = True
+            log.error(f"[Extract] ALL {papers_extracted} extractions failed! Likely an API error.")
         else:
-            papers_extracted = 0
-            new_findings_count = 0
+            # Write successful findings to temp file
+            new_findings_count = write_findings_to_file(ok_findings, temp_path)
+            log.info(f"[Extract] {new_findings_count} successful extractions written to temp")
 
-    report = compute_evidence_score(FINDINGS_JSONL)
-    delta = report.evidence_score - prev_score
-
-    if new_findings_count == 0 and papers_found == 0:
-        status = "no_papers"
-    elif delta >= 0.005:
-        status = "keep"
-    elif delta >= 0:
-        status = "marginal"
+    # ── Step 3: Compute score with temp merged ──
+    if new_findings_count > 0:
+        new_score = compute_score_with_temp(temp_path)
     else:
-        status = "no_gain"
+        new_score = prev_score
+    delta = new_score - prev_score
 
-    desc = f"[iter{iteration+1}] {query[:60]} | +{new_findings_count} findings | delta={delta:+.4f}"
+    # ── Step 4: Keep or Discard (autoresearch pattern) ──
+    if all_failed:
+        status = "api_error"
+        log.error(f"[Decision] ❌ API_ERROR — all extractions failed, nothing to keep")
+    elif new_findings_count == 0 and papers_found == 0:
+        status = "no_papers"
+        log.info(f"[Decision] — NO_PAPERS — no new papers found")
+    elif new_findings_count == 0:
+        status = "no_findings"
+        log.info(f"[Decision] — NO_FINDINGS — extraction yielded nothing")
+    elif delta > 0:
+        # KEEP — merge temp findings into main file
+        status = "keep"
+        merged = merge_findings(temp_path)
+        log.info(f"[Decision] ✅ KEEP — evidence_score {prev_score:.6f} → {new_score:.6f} (Δ={delta:+.6f}), merged {merged} findings")
+    else:
+        # DISCARD — throw away temp findings (autoresearch: git reset)
+        status = "discard"
+        log.info(f"[Decision] ❌ DISCARD — evidence_score {prev_score:.6f} → {new_score:.6f} (Δ={delta:+.6f}), no improvement")
+
+    # Clean up temp file
+    if temp_path.exists():
+        temp_path.unlink()
+
+    # ── Step 5: Report ──
+    report = compute_evidence_score(FINDINGS_JSONL)
+    desc = f"[iter{iteration+1}] {query[:50]} | +{new_findings_count} findings | Δ={delta:+.4f} | {status}"
     run_seconds = time.time() - t_start
 
     log.info(f"\n[Results] Iteration {iteration+1} complete in {run_seconds:.1f}s")
@@ -284,6 +369,7 @@ def run_experiment(iteration: int, dry_run: bool = False) -> dict:
         "delta": delta,
         "run_seconds": run_seconds,
         "description": desc,
+        "all_failed": all_failed,
     }
 
 
@@ -294,8 +380,11 @@ def run_loop(
 ):
     t_wall_start = time.time()
     init_results_tsv()
+    consecutive_api_fails = 0
+    MAX_CONSECUTIVE_API_FAILS = 3  # stop loop after 3 consecutive all-fail iterations
 
     log.info(f"[Research] Starting Learnzy Focus Score validation loop")
+    log.info(f"[Research] Pattern: autoresearch keep/discard — only improvements are kept")
     log.info(f"[Research] Hypothesis: Focus Score (0.4×HRV + 0.6×Sleep) → mental health + cognition")
     log.info(f"[Research] Time budget: {max_wall_seconds}s | Dry run: {dry_run}")
     log.info(f"[Research] Validated pilot: Cohen's d=1.536, PHQ-9 r=−0.452, ISI r=−0.591")
@@ -314,8 +403,22 @@ def run_loop(
         try:
             metrics = run_experiment(iteration, dry_run=dry_run)
 
+            # Early-stop: if API is broken, don't burn through all iterations
+            if metrics.get("all_failed"):
+                consecutive_api_fails += 1
+                if consecutive_api_fails >= MAX_CONSECUTIVE_API_FAILS:
+                    log.error(f"[Research] {MAX_CONSECUTIVE_API_FAILS} consecutive API failures. Stopping loop.")
+                    log.error(f"[Research] Check your ANTHROPIC_API_KEY and credit balance.")
+                    break
+            else:
+                consecutive_api_fails = 0
+
             if not dry_run:
-                commit = git_commit(metrics["description"])
+                # Only git commit on KEEP (like autoresearch advances the branch)
+                if metrics["status"] == "keep":
+                    commit = git_commit(metrics["description"])
+                else:
+                    commit = git_current_commit()
                 log_result(
                     commit=commit,
                     score=metrics["evidence_score"],
