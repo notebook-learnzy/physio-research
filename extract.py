@@ -1,11 +1,11 @@
 """
-extract.py — LLM-based Focus Score evidence extractor using Claude Haiku
+extract.py — LLM-based Focus Score evidence extractor using OpenAI GPT
 Reads paper abstracts and extracts structured evidence for the Learnzy Focus Score hypothesis.
 
 Focus Score = 0.6 × Sleep Recovery + 0.4 × HRV Readiness (composite metric, not separate)
 
 Token budget: 2000 tokens/minute over 3 days = 8,640,000 tokens total
-Claude Haiku is used for cost efficiency.
+OpenAI gpt-4o-mini is used for cost efficiency.
 """
 
 import os
@@ -16,13 +16,13 @@ import argparse
 from dataclasses import dataclass, asdict
 from typing import Optional
 
-import anthropic
-from anthropic import BadRequestError, NotFoundError, AuthenticationError
+import openai
+from openai import APIError, AuthenticationError, RateLimitError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_not_exception_type
 
 log = logging.getLogger("extract")
 
-CLAUDE_MODEL = "claude-haiku-4-5-20251001"  # Claude 4.5 Haiku is the latest valid API model
+OPENAI_MODEL = "gpt-4o-mini"
 MAX_TOKENS_PER_CALL = 1024
 TARGET_TOKENS_PER_MIN = 2000  # rate limit to stay within budget
 
@@ -138,21 +138,21 @@ class Finding:
     extraction_ok: bool = True
 
 
-def make_client() -> anthropic.Anthropic:
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+def make_client() -> openai.OpenAI:
+    api_key = os.environ.get("OPENAI_API_KEY", "")
     if not api_key:
-        raise EnvironmentError("ANTHROPIC_API_KEY not set. Add it to environment or GitHub Secrets.")
+        raise EnvironmentError("OPENAI_API_KEY not set. Add it to environment or GitHub Secrets.")
     masked = api_key[:8] + "..." + api_key[-4:] if len(api_key) > 12 else "***"
-    log.info(f"[Extract] Using model={CLAUDE_MODEL}, API key={masked}")
-    return anthropic.Anthropic(api_key=api_key)
+    log.info(f"[Extract] Using model={OPENAI_MODEL}, API key={masked}")
+    return openai.OpenAI(api_key=api_key)
 
 
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(min=2, max=30),
-    retry=retry_if_not_exception_type((BadRequestError, NotFoundError, AuthenticationError)),
+    retry=retry_if_not_exception_type((AuthenticationError,)),
 )
-def extract_finding(client: anthropic.Anthropic, paper: dict) -> Finding:
+def extract_finding(client: openai.OpenAI, paper: dict) -> Finding:
     """Extract structured Focus Score evidence from one paper abstract."""
     abstract = paper.get("abstract", "").strip()
     if not abstract:
@@ -182,22 +182,26 @@ def extract_finding(client: anthropic.Anthropic, paper: dict) -> Finding:
     limiter.wait_if_needed(estimated_in + estimated_out)
 
     try:
-        response = client.messages.create(
-            model=CLAUDE_MODEL,
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
             max_tokens=MAX_TOKENS_PER_CALL,
             messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
         )
-    except (BadRequestError, NotFoundError, AuthenticationError) as e:
+    except AuthenticationError as e:
         log.error(f"[Extract] FATAL API error (will NOT retry): {type(e).__name__}")
-        log.error(f"[Extract] Status: {e.status_code}, Body: {e.body}")
-        log.error(f"[Extract] Model used: {CLAUDE_MODEL}")
+        log.error(f"[Extract] Status: Authentication failed")
+        log.error(f"[Extract] Model used: {OPENAI_MODEL}")
+        raise
+    except APIError as e:
+        log.error(f"[Extract] API error: {type(e).__name__} | {e}")
         raise
 
-    out_tokens = response.usage.output_tokens if response.usage else estimated_out
-    in_tokens = response.usage.input_tokens if response.usage else estimated_in
+    out_tokens = response.usage.completion_tokens if response.usage else estimated_out
+    in_tokens = response.usage.prompt_tokens if response.usage else estimated_in
     limiter.record(in_tokens + out_tokens)
 
-    raw = response.content[0].text.strip()
+    raw = response.choices[0].message.content.strip()
 
     try:
         data = json.loads(raw)

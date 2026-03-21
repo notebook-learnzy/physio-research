@@ -53,7 +53,7 @@ jobs:
 
       - name: Run research experiment
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
           ITERS="${{ github.event.inputs.iterations || '' }}"
